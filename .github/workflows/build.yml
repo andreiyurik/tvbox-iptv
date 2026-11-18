@@ -1,0 +1,75 @@
+name: Build playlists and EPG
+
+on:
+  schedule:
+    - cron: "30 0 * * *" # daily, 03:30 Moscow
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build playlists and channel lists
+        run: python3 scripts/build.py "${{ steps.pages.outputs.base_url }}"
+
+      - name: Install iptv-org/epg
+        run: |
+          git clone --depth 1 https://github.com/iptv-org/epg.git epg
+          cd epg && npm ci --no-audit --no-fund
+
+      - name: Grab EPG
+        working-directory: epg
+        run: |
+          for lang in ru en; do
+            npm run grab --- --channels="../build/$lang.channels.xml" \
+              --output="../out/$lang.xml" --gzip="../out/$lang.xml.gz" \
+              --days=2 --maxConnections=10 --timeout=15000 \
+              || echo "::warning::grab for $lang exited with an error"
+          done
+
+      - name: Keep previous guide if a grab failed
+        run: |
+          for lang in ru en; do
+            f="out/$lang.xml.gz"
+            if [ ! -s "$f" ] || [ "$(stat -c %s "$f")" -lt 2000 ]; then
+              echo "::warning::$lang guide missing, reusing the published one"
+              curl -fsSL -o "$f" "${{ steps.pages.outputs.base_url }}/$lang.xml.gz" || true
+            fi
+          done
+          rm -f out/*.xml
+          ls -la out
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
